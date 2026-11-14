@@ -211,7 +211,8 @@ def export_clean_samples(image, accepted, all_boxes,
     folder.mkdir(parents=True, exist_ok=True)
 
     rng = random.Random(seed)
-    gray = core.prepare_gray(image)
+    prepared = core.prepare_gray(image)
+    gray = prepared[0] if isinstance(prepared, tuple) else prepared
     height, width = gray.shape
 
     examples = []

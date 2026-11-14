@@ -498,6 +498,9 @@ def main():
     parser.add_argument("--size",type=int,default=96)
     parser.add_argument("--negative-ratio",type=float,default=1.0)
     parser.add_argument("--seed",type=int,default=42)
+    parser.add_argument("--scale-adjust", type=float, default=1.0)
+    parser.add_argument("--shift-x", type=float, default=0.0)
+    parser.add_argument("--shift-y", type=float, default=0.0)
     args=parser.parse_args()
 
     image=load_image(args.image)
@@ -510,6 +513,16 @@ def main():
     params,error,thumb_shape=align_svg(
         image,viewbox,walls,args.rotation
     )
+
+    angle, scale, dx, dy = params
+
+    params = (
+    angle,
+    scale * args.scale_adjust,
+    dx + args.shift_x,
+    dy + args.shift_y
+    )
+
     annotations=extract_annotations(
         objects,viewbox,image.shape,thumb_shape,params
     )
