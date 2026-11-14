@@ -481,7 +481,7 @@ def is_good_patch(patch, min_size=12, min_ink_ratio=0.005):
 
 
 def save_patch(patch, out_path, patch_size=96):
-    resized = cv2.resize(patch, (patch_size, patch_size), interpolation=cv2.INTER_AREA)
+    resized = letterbox_resize(patch, patch_size)
     cv2.imwrite(out_path, resized)
     return resized
 
@@ -505,7 +505,9 @@ def sample_background_boxes(image_w, image_h, positive_boxes, how_many=20, patch
 
         bad = False
         for pb in positive_boxes:
-            if iou_xyxy(cand, pb) > 0.05:
+            if (min(cand[2], pb[2]) > max(cand[0], pb[0])
+                and min(cand[3], pb[3]) > max(cand[1], pb[1])):
+
                 bad = True
                 break
 
@@ -600,6 +602,114 @@ def build_pairs_for_split(index_rows, out_csv, negatives_per_positive=1):
 # MAIN DATASET BUILD
 # =========================================================
 
+
+def collect_labeled_objects_auto(svg_path, image, max_error=7.0):
+    import svg_to_labels as align
+    import svg_to_labels_auto as quality
+
+    viewbox, objects, walls = align.read_svg(svg_path)
+    if not walls:
+        raise ValueError("No wall polygons in SVG")
+
+    if hasattr(align, "find_alignment") and hasattr(align, "alignment_matrix"):
+        params, error = align.find_alignment(
+            image, viewbox, walls, orientation="auto"
+        )
+        matrix = align.alignment_matrix(viewbox, image.shape, params)
+        transformed = [
+            {
+                **obj,
+                "points": align.transform_points(obj["points"], matrix)
+            }
+            for obj in objects
+        ]
+        labels = align.extract_annotations(
+            transformed, image.shape[1], image.shape[0]
+        )
+
+    elif hasattr(align, "align_svg") and hasattr(align, "transform_to_image"):
+        params, error, thumb_shape = align.align_svg(
+            image, viewbox, walls, orientation="auto"
+        )
+        transformed = [
+            {
+                **obj,
+                "points": align.transform_to_image(
+                    obj["points"], viewbox, image.shape,
+                    thumb_shape, params
+                )
+            }
+            for obj in objects
+        ]
+        labels = align.extract_annotations(
+            objects, viewbox, image.shape, thumb_shape, params
+        )
+    else:
+        raise RuntimeError("Unsupported svg_to_labels.py API")
+
+    if not np.isfinite(error) or error > max_error:
+        raise ValueError(f"Alignment rejected: {error:.3f}")
+
+    near_edges, ink = quality.create_evidence_maps(image)
+    accepted = []
+    rejected = 0
+
+    for label in labels:
+        points = transformed[label["id"]]["points"]
+        check = quality.verify_object(
+            {**label, "points": points},
+            image.shape, near_edges, ink
+        )
+        if check["accepted"]:
+            accepted.append({
+                "class": label["class"],
+                "bbox": label["bbox"]
+            })
+        else:
+            rejected += 1
+
+    print(
+        f"[ALIGN] error={error:.3f} "
+        f"accepted={len(accepted)} rejected={rejected}",
+        flush=True
+    )
+    return accepted, labels
+
+
+
+def letterbox_resize(image, size=96):
+    h, w = image.shape[:2]
+
+    if h == 0 or w == 0:
+        raise ValueError("Empty image patch")
+
+    scale = min(size / w, size / h)
+    new_w = max(1, round(w * scale))
+    new_h = max(1, round(h * scale))
+
+    resized = cv2.resize(
+        image,
+        (new_w, new_h),
+        interpolation=cv2.INTER_AREA
+    )
+
+    if image.ndim == 2:
+        output = np.full((size, size), 255, dtype=np.uint8)
+    else:
+        output = np.full(
+            (size, size, image.shape[2]),
+            255,
+            dtype=np.uint8
+        )
+
+    x = (size - new_w) // 2
+    y = (size - new_h) // 2
+
+    output[y:y + new_h, x:x + new_w] = resized
+    return output
+
+
+
 def process_split(root, split_name, split_items, out_root, patch_size, context_ratio,
                   max_samples=None, backgrounds_per_image=8):
     index_rows = []
@@ -611,8 +721,8 @@ def process_split(root, split_name, split_items, out_root, patch_size, context_r
 
     processed = 0
 
-    for item in split_items:
-        if max_samples is not None and processed >= max_samples:
+    for attempt_index, item in enumerate(split_items):
+        if max_samples is not None and attempt_index >= max_samples:
             break
 
         sample_dir = resolve_sample_folder(root, item)
@@ -635,21 +745,23 @@ def process_split(root, split_name, split_items, out_root, patch_size, context_r
             reject_counts["unreadable_image"] += 1
             continue
 
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         image_h, image_w = image.shape[:2]
         sample_id = os.path.basename(sample_dir)
 
         try:
-            objects = collect_labeled_objects(svg_path, image_w, image_h)
+            objects, raw_annotations = collect_labeled_objects_auto(svg_path, image)
         except Exception as e:
             print(f"[WARN] SVG parse failed for {sample_id}: {e}")
             reject_counts["svg_parse_fail"] += 1
             continue
+        
 
         if len(objects) == 0:
             reject_counts["no_objects"] += 1
             continue
 
-        positive_boxes = []
+        positive_boxes = [ obj["bbox"] for obj in raw_annotations ]
 
         per_image_counter = defaultdict(int)
         per_image_hashes = set()
@@ -664,7 +776,7 @@ def process_split(root, split_name, split_items, out_root, patch_size, context_r
                 reject_counts[f"bad_patch_{cls_name}"] += 1
                 continue
 
-            resized = cv2.resize(patch, (patch_size, patch_size), interpolation=cv2.INTER_AREA)
+            resized = letterbox_resize(patch, patch_size)
             patch_hash = sha1_array(resized)
 
             if patch_hash in per_image_hashes:
@@ -704,7 +816,6 @@ def process_split(root, split_name, split_items, out_root, patch_size, context_r
             })
 
             class_counts[cls_name] += 1
-            positive_boxes.append(bbox)
 
         # Background patches (hard negatives)
         if backgrounds_per_image > 0 and len(positive_boxes) > 0:
@@ -718,7 +829,7 @@ def process_split(root, split_name, split_items, out_root, patch_size, context_r
                 if not is_good_patch(patch, min_ink_ratio=0.001):
                     continue
 
-                resized = cv2.resize(patch, (patch_size, patch_size), interpolation=cv2.INTER_AREA)
+                resized = letterbox_resize(patch, patch_size)
                 out_name = f"{sample_id}_background_{i:03d}.png"
                 out_path = os.path.join(bg_dir, out_name)
                 cv2.imwrite(out_path, resized)
